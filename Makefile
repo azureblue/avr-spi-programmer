@@ -1,6 +1,13 @@
-CC=gcc
+CC = gcc
+CFLAGS = -std=c11 -O2 -Wall
 
-atmega8-programmer: atmega8-programmer.c
-	$(CC) atmega8-programmer.c -O2 -Wall -std=c11 -o atmega8-programmer
+OBJ = gpio.o error.o atmega8-programmer.o 
 
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
+atmega8-programmer: $(OBJ)
+	$(CC) $(CFLAGS) -o atmega8-programmer $(OBJ)
+	
+clean: 
+	rm -f *.o atmega8-programmer

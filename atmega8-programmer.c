@@ -7,39 +7,27 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdnoreturn.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <linux/types.h>
 #include <linux/spi/spidev.h>
 
+#include "gpio.h"
+extern noreturn void print_error_end_exit(char * error);
+
 #define flash_size (1024 * 8)
-const int page_size_in_words = 32;
-const int page_size_in_bytes = page_size_in_words * 2;
+#define page_size_in_words 32
+#define page_size_in_bytes 64
 
 int gpioPin = 22;
 int mode = 0;
 int speed = 100000;
 char * driver = "/dev/spidev0.0";
-int spi_fd = -1;
 
-static uint8_t tx_buf[1024 * 8];
-static uint8_t rx_buf[1024 * 8];
+static int spi_fd = -1;
 
-void print_byte(uint8_t byte) {
-    printf("%.2X", byte);
-}
-
-void print_4_bytes(uint8_t buf[]) {
-    printf("%.2X %.2X %.2X %.2X", buf[0], buf[1], buf[2], buf[3]);
-}
-
-void print_error_end_exit(char * error) {
-    if (errno != 0)
-        perror(error);
-    else
-        puts(error);
-    exit(-1);
-}
+static uint8_t tx_buf[page_size_in_bytes * 4];
+static uint8_t rx_buf[page_size_in_bytes * 4];
 
 void delay(int ms) {
     struct timespec req = {
@@ -66,11 +54,10 @@ void send_data(int len) {
 
 #ifdef DEBUG
     for(int i = 0; i < len; i += 4) {
-        print_4_bytes(tx_buf + i);
-        printf(" : ");
-
-        print_4_bytes(rx_buf + i);
-        printf("\n");
+        uint8_t * buf_ptr = tx_buf + i;
+        printf("%.2X %.2X %.2X %.2X : ", buf_ptr, buf_ptr + 1, buf_ptr + 2, buf_ptr + 3);
+        buf_ptr = rx_buf + i;
+        printf("%.2X %.2X %.2X %.2X", buf_ptr, buf_ptr + 1, buf_ptr + 2, buf_ptr + 3);
     }
     printf("\n");
 #endif
@@ -184,20 +171,6 @@ void check_signature() {
         print_error_end_exit(" : not matching ATmega8!");
 }
 
-void set_reset(bool high) {
-    char gpio_value_path[100];
-    snprintf(gpio_value_path, 100, "/sys/class/gpio/gpio%d/value", gpioPin);
-
-    FILE *gpio_value = fopen(gpio_value_path, "w");
-    if (!gpio_value)
-        print_error_end_exit("setting gpio failed");
-
-    fprintf(gpio_value, high ? "1" : "0");
-    fflush(gpio_value);
-    fclose(gpio_value);
-}
-
-
 void write_flash_from_file(char *path) {
     uint8_t file_data[flash_size];
     uint8_t flash_data[flash_size];
@@ -223,9 +196,10 @@ void write_flash_from_file(char *path) {
     erase_chip();
 
     write_flash(file_data, file_len, true);
-    set_reset(1);
+
+    gpio_set(gpioPin, 1);
     delay(100);
-    set_reset(0);
+    gpio_set(gpioPin, 0);
 
     enable_programming();
 
@@ -245,26 +219,9 @@ void write_flash_from_file(char *path) {
         puts("flash programming OK!");
 }
 
-int main(int argc, char ** argv) {
-    char gpio_direction_path[100];
-    snprintf(gpio_direction_path, 100, "/sys/class/gpio/gpio%d/direction", gpioPin);
-    if( access(gpio_direction_path, F_OK ) == -1) {
-        FILE *export = fopen("/sys/class/gpio/export", "w");
-        if (!export) {
-            print_error_end_exit("setting gpio failed");
-        }
-        fprintf(export, "%d", gpioPin);
-        fclose(export);
-        if (access(gpio_direction_path, F_OK) == -1) {
-            print_error_end_exit("setting gpio failed");
-        }
-    }
+int main(int argc, char ** argv) {    
 
-    FILE *gpio_direction = fopen(gpio_direction_path, "w");
-    if (!gpio_direction)
-        print_error_end_exit("setting gpio failed");
-    fprintf(gpio_direction, "out");
-    fclose(gpio_direction);
+    gpio_init_out(22);
 
     spi_fd = open(driver, O_RDWR);
     if (spi_fd == -1) {
@@ -282,9 +239,9 @@ int main(int argc, char ** argv) {
     if (ioctl(spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed) == -1)
         print_error_end_exit("setting spi read max speed failed");
 
-    set_reset(1);
+    gpio_set(gpioPin, 1);
     delay(100);
-    set_reset(0);
+    gpio_set(gpioPin, 0);
 
     enable_programming();
     check_signature();
@@ -297,7 +254,7 @@ int main(int argc, char ** argv) {
     if (argc > 1 && argv[1] != NULL)
         write_flash_from_file(argv[1]);
 
-    set_reset(1);
+    gpio_set(gpioPin, 1);
     close(spi_fd);
 
     return 0;

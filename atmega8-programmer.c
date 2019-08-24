@@ -75,9 +75,9 @@ void send_data(int len) {
 #ifdef DEBUG
     for(int i = 0; i < len; i += 4) {
         uint8_t * buf_ptr = tx_buf + i;
-        printf("%.2X %.2X %.2X %.2X : ", buf_ptr, buf_ptr + 1, buf_ptr + 2, buf_ptr + 3);
+        printf("%.2X %.2X %.2X %.2X : ", buf_ptr[0], buf_ptr[1], buf_ptr[2], buf_ptr[3]);
         buf_ptr = rx_buf + i;
-        printf("%.2X %.2X %.2X %.2X", buf_ptr, buf_ptr + 1, buf_ptr + 2, buf_ptr + 3);
+        printf("%.2X %.2X %.2X %.2X", buf_ptr[0], buf_ptr[1], buf_ptr[2], buf_ptr[3]);
     }
     printf("\n");
 #endif
@@ -97,7 +97,7 @@ uint8_t read_signature_byte(uint8_t addr) {
 }
 
 uint8_t read_fuse_bits(bool high) {
-    set_instruction(0, 0x50 | (high << 3), 0x00, 0x00, 0x00);
+    set_instruction(0, 0x50 | (high << 3), 0x00 | (high << 3), 0x00, 0x00);
     send_data(4);
     return rx_buf[3];
 }

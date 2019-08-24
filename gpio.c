@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include <stdnoreturn.h>
 
-
 #define path_size_max 100
 
 static bool check_file_exists(const char *path) {

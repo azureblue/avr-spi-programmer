@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#include <getopt.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -19,15 +20,34 @@ extern noreturn void print_error_end_exit(char * error);
 #define page_size_in_words 32
 #define page_size_in_bytes 64
 
-int gpioPin = 22;
-int mode = 0;
-int speed = 100000;
-char * driver = "/dev/spidev0.0";
+#define instruction_size 4
+#define buffer_size (page_size_in_bytes * instruction_size)
+
+static const int OP_WRITE_FUSE_LOW = 1, OP_WRITE_FUSE_HIGH = 2, OP_WRITE_FLASH = 4;
+
+struct {
+    uint32_t enabled_operations_bitset;
+    uint8_t fuse_low;
+    uint8_t fuse_high;
+    const char * flash_file;
+} op_params = {.enabled_operations_bitset = 0};
+
+struct {
+    int reset_gpio_pin;
+    int spi_mode;
+    int spi_speed;
+    char * spi_device;
+} conn_params = {
+    .reset_gpio_pin = 22,
+    .spi_mode = 0,
+    .spi_speed = 100000,
+    .spi_device = "/dev/spidev0.0"
+};
 
 static int spi_fd = -1;
+static uint8_t tx_buf[buffer_size];
+static uint8_t rx_buf[buffer_size];
 
-static uint8_t tx_buf[page_size_in_bytes * 4];
-static uint8_t rx_buf[page_size_in_bytes * 4];
 
 void delay(int ms) {
     struct timespec req = {
@@ -44,7 +64,7 @@ void send_data(int len) {
         .tx_buf = (intptr_t) tx_buf,
         .rx_buf = (intptr_t) rx_buf,
         .len = len,
-        .speed_hz = speed,
+        .speed_hz = conn_params.spi_speed,
         .delay_usecs = 0,
         .bits_per_word = 8
     };
@@ -89,17 +109,35 @@ void enable_programming() {
         print_error_end_exit("unable to enter programming mode");
 }
 
+void check_signature() {
+    uint8_t b1 = read_signature_byte(0x00);
+    uint8_t b2 = read_signature_byte(0x01);
+    uint8_t b3 = read_signature_byte(0x02);
+
+    printf("device signature: 0x%.2X 0x%.2X 0x%.2X", b1, b2, b3);
+    if (b1 == 0x1E && b2 == 0x93 && b3 == 0x07)
+        printf (" | ATmega8\n");
+    else
+        print_error_end_exit(" : not matching ATmega8!");
+}
+
+void reset_short_pulse() {
+    gpio_set(conn_params.reset_gpio_pin, 1);
+    delay(100);
+    gpio_set(conn_params.reset_gpio_pin, 0);
+}
+
 void show_progress(const char * message, const char * units, int count, int limit) {
-        printf("\r");
-        printf("%s \t%d/%d %s ", message, count, limit, units);
-        if (count == limit)
-            puts("");
-        fflush(stdout);            
+    printf("\r");
+    printf("%s \t%d/%d %s ", message, count, limit, units);
+    if (count == limit)
+        puts("");
+    fflush(stdout);
 }
 
 void read_program_memory(uint16_t word_addres, uint8_t buffer[], int len, bool progress) {
     bool high = false;
-    int bytes_to_read_in_each_message = page_size_in_bytes;
+    int bytes_to_read_in_each_message = buffer_size / 4;
 
     for (int i = 0; i < len;) {
         int bytes_for_current_read = len - i;
@@ -118,7 +156,7 @@ void read_program_memory(uint16_t word_addres, uint8_t buffer[], int len, bool p
             buffer[i + j] = rx_buf[j * 4 + 3];
 
         if (progress)
-            show_progress(" # reading flash", "bytes", i + bytes_for_current_read, len);    
+            show_progress(" # reading flash", "bytes", i + bytes_for_current_read, len);
 
         i += bytes_for_current_read;
     }
@@ -139,8 +177,19 @@ void write_program_memory_page(int page_number) {
     delay(10);
 }
 
+void write_fuse_bits(uint8_t value, bool high) {
+    set_instruction(0, 0xAC, 0xA0 | high << 3, 0, value);
+    send_data(4);
+    printf(" # writting fuse %s: 0x%.2X\n", high ? "high" : "low", value);
+    delay(10);
+}
+
 void write_flash(uint8_t data[], int len, bool progress) {
-    for (int i = 0, page = 0; i < len;) {        
+#if buffer_size < (page_size_in_bytes * 4)
+#error "buffer_size is too small"
+#endif
+
+    for (int i = 0, page = 0; i < len;) {
         int bytes_for_current_page = len - i;
         if (bytes_for_current_page > page_size_in_bytes)
             bytes_for_current_page = page_size_in_bytes;
@@ -152,6 +201,7 @@ void write_flash(uint8_t data[], int len, bool progress) {
         }
         if (progress)
             show_progress(" # writting flash", "bytes", i + bytes_for_current_page, len);
+
         send_data(bytes_for_current_page * 4);
         write_program_memory_page(page);
         page++;
@@ -159,19 +209,7 @@ void write_flash(uint8_t data[], int len, bool progress) {
     }
 }
 
-void check_signature() {
-    uint8_t b1 = read_signature_byte(0x00);
-    uint8_t b2 = read_signature_byte(0x01);
-    uint8_t b3 = read_signature_byte(0x02);
-
-    printf("device signature: 0x%.2X 0x%.2X 0x%.2X", b1, b2, b3);
-    if (b1 == 0x1E && b2 == 0x93 && b3 == 0x07)
-        printf (" | ATmega8\n");
-    else
-        print_error_end_exit(" : not matching ATmega8!");
-}
-
-void write_flash_from_file(char *path) {
+void write_flash_from_file(const char *path) {
     uint8_t file_data[flash_size];
     uint8_t flash_data[flash_size];
     struct stat file_stat;
@@ -194,15 +232,9 @@ void write_flash_from_file(char *path) {
     }
 
     erase_chip();
-
     write_flash(file_data, file_len, true);
-
-    gpio_set(gpioPin, 1);
-    delay(100);
-    gpio_set(gpioPin, 0);
-
+    reset_short_pulse();
     enable_programming();
-
     read_program_memory(0, flash_data, file_len, true);
 
     bool mismatch = false;
@@ -219,43 +251,96 @@ void write_flash_from_file(char *path) {
         puts("flash programming OK!");
 }
 
-int main(int argc, char ** argv) {    
+void parse_cmd_line(int argc, char ** argv) {
+    static struct option long_options[] = {
+        {"fuseL", required_argument, NULL, 'l'},
+        {"fuseH", required_argument, NULL, 'h'},
+        {"flash", required_argument, NULL, 'f'},
+        {"spi-driver", required_argument, NULL, 'd'},
+        {"spi-speed-hz", required_argument, NULL, 's'},
+        {"reset-pin", required_argument, NULL, 'r'},
+        {NULL, 0, NULL, 0}
+    };
+    int c;
+    while ((c = getopt_long(argc, argv, "l:h:f:", long_options, NULL)) != -1) {
+        switch (c) {
+        case 'l':
+            if (sscanf(optarg, "%hhx", &op_params.fuse_low) == 0)
+                print_error_end_exit("unable to parse --fuseL argument");
+            op_params.enabled_operations_bitset |= OP_WRITE_FUSE_LOW;
+            break;
+        case 'h':
+            if (sscanf(optarg, "%hhx", &op_params.fuse_high) == 0)
+                print_error_end_exit("unable to parse --fuseH argument");
+            op_params.enabled_operations_bitset |= OP_WRITE_FUSE_HIGH;
+            break;
+        case 'f':
+            op_params.flash_file = optarg;
+            op_params.enabled_operations_bitset |= OP_WRITE_FLASH;
+            break;
 
-    gpio_init_out(22);
+//
 
-    spi_fd = open(driver, O_RDWR);
+        case 'd':
+            conn_params.spi_device = optarg;
+            break;
+        case 's':
+            if (sscanf(optarg, "%d", &conn_params.spi_speed) == 0)
+                print_error_end_exit("unable to parse --spi-speed-hz argument");
+            break;
+        case 'r':
+            if (sscanf(optarg, "%d", &conn_params.reset_gpio_pin) == 0)
+                print_error_end_exit("unable to parse --reset-pin argument");
+            break;
+        case '?':
+            exit(-1);
+            break;
+        }
+    }
+}
+
+int main(int argc, char ** argv) {
+    parse_cmd_line(argc, argv);
+    gpio_init_out(conn_params.reset_gpio_pin);
+
+    spi_fd = open(conn_params.spi_device, O_RDWR);
     if (spi_fd == -1) {
-        perror("cannot open spi driver");
+        perror("cannot open spi device");
         exit(-1);
     }
 
-    if (ioctl(spi_fd, SPI_IOC_RD_MODE, &mode) == -1)
+    if (ioctl(spi_fd, SPI_IOC_RD_MODE, &conn_params.spi_mode) == -1)
         print_error_end_exit("setting spi read mode failed");
-    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) == -1)
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &conn_params.spi_mode) == -1)
         print_error_end_exit("setting spi write mode failed");
-    // for some reason SPI_IOC_WR_MAX_SPEED_HZ needs to be first...
-    if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) == -1)
+    // for some reason SPI_IOC_WR_MAX_SPEED_HZ needs to be setup first...
+    if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &conn_params.spi_speed) == -1)
         print_error_end_exit("setting spi write max speed failed");
-    if (ioctl(spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &speed) == -1)
+    if (ioctl(spi_fd, SPI_IOC_RD_MAX_SPEED_HZ, &conn_params.spi_speed) == -1)
         print_error_end_exit("setting spi read max speed failed");
 
-    gpio_set(gpioPin, 1);
-    delay(100);
-    gpio_set(gpioPin, 0);
+    reset_short_pulse();
 
     enable_programming();
     check_signature();
-
+    
     uint8_t lfuse = read_fuse_bits(false);
     uint8_t hfuse = read_fuse_bits(true);
 
     printf("fuses: h:0x%.2X  l:0x%.2X \n", hfuse, lfuse);
 
-    if (argc > 1 && argv[1] != NULL)
-        write_flash_from_file(argv[1]);
+    if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_LOW)
+        write_fuse_bits(op_params.fuse_low, false);
 
-    gpio_set(gpioPin, 1);
+    if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_HIGH)
+        write_fuse_bits(op_params.fuse_high, true);
+
+    if (op_params.enabled_operations_bitset & OP_WRITE_FLASH)
+        write_flash_from_file(op_params.flash_file);
+
+    reset_short_pulse();
+    gpio_set(conn_params.reset_gpio_pin, 1);
+
     close(spi_fd);
-
     return 0;
 }

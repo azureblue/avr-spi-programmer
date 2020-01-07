@@ -14,21 +14,26 @@
 #include <linux/spi/spidev.h>
 
 #include "gpio.h"
-extern noreturn void print_error_end_exit(char * error);
+#include "config.h"
 
-#define flash_size (1024 * 8)
-#define page_size_in_words 32
-#define page_size_in_bytes 64
+extern noreturn void print_error_end_exit(char * error);
+extern void delay(int ms);
 
 #define instruction_size 4
-#define buffer_size (page_size_in_bytes * instruction_size)
+#define word_size 2
 
-static const int OP_WRITE_FUSE_LOW = 1, OP_WRITE_FUSE_HIGH = 2, OP_WRITE_FLASH = 4;
+static uint32_t flash_size;
+static uint32_t page_size_in_words;
+static uint32_t page_size_in_bytes;
+static uint32_t page_offset;
+
+static const int OP_WRITE_FUSE_LOW = 1, OP_WRITE_FUSE_HIGH = 2, OP_WRITE_FUSE_EXTENDED = 4, OP_WRITE_FLASH = 8;
 
 struct {
     uint32_t enabled_operations_bitset;
     uint8_t fuse_low;
     uint8_t fuse_high;
+    uint8_t fuse_extended;
     const char * flash_file;
 } op_params = {.enabled_operations_bitset = 0};
 
@@ -40,29 +45,29 @@ struct {
 } conn_params = {
     .reset_gpio_pin = 22,
     .spi_mode = 0,
-    .spi_speed = 100000,
+    .spi_speed = 200000,
     .spi_device = "/dev/spidev0.0"
 };
 
 static int spi_fd = -1;
-static uint8_t tx_buf[buffer_size];
-static uint8_t rx_buf[buffer_size];
 
+static const struct atmega_memory_config * mem_config = NULL;
 
-void delay(int ms) {
-    struct timespec req = {
-        .tv_sec = ms / 1000,
-        .tv_nsec = (ms % 1000) * 1000000,
-    };
-    if (nanosleep(&req, NULL)) {
-        print_error_end_exit("sleep error");
-    }
+void setup(const struct atmega_memory_config * conf) {
+    mem_config = conf;
+    flash_size = conf->flash_page_size_in_words * conf->flash_number_of_pages * word_size;
+    page_size_in_words = conf->flash_page_size_in_words;
+    page_size_in_bytes = page_size_in_words * word_size;
+    page_offset = 0;
+    uint32_t ps = page_size_in_words;
+    while (ps >>= 1 != 0)
+        page_offset++;
 }
 
-void send_data(int len) {
+void send_data(uint8_t * tx, uint8_t * rx, int len) {
     struct spi_ioc_transfer ioc_transfer =  {
-        .tx_buf = (intptr_t) tx_buf,
-        .rx_buf = (intptr_t) rx_buf,
+        .tx_buf = (intptr_t) tx,
+        .rx_buf = (intptr_t) rx,
         .len = len,
         .speed_hz = conn_params.spi_speed,
         .delay_usecs = 0,
@@ -83,48 +88,53 @@ void send_data(int len) {
 #endif
 }
 
-static void set_instruction(int offset, uint8_t byte1, uint8_t byte2, uint8_t byte3, uint8_t byte4) {
-    tx_buf[offset + 0] = byte1;
-    tx_buf[offset + 1] = byte2;
-    tx_buf[offset + 2] = byte3;
-    tx_buf[offset + 3] = byte4;
+static void set_instruction(uint8_t * buf, uint8_t byte1, uint8_t byte2, uint8_t byte3, uint8_t byte4) {
+    buf[0] = byte1;
+    buf[1] = byte2;
+    buf[2] = byte3;
+    buf[3] = byte4;
+}
+
+uint32_t send_instruction(uint8_t byte1, uint8_t byte2, uint8_t byte3, uint8_t byte4) {
+    uint8_t tx[] = {byte1, byte2, byte3, byte4};
+    uint8_t rx[] = {0x00, 0x00, 0x00, 0x00};
+    send_data(tx, rx, 4);
+    return rx[0] << 24 | rx[1] << 16 | rx[2] << 8 | rx[3];
 }
 
 uint8_t read_signature_byte(uint8_t addr) {
-    set_instruction(0, 0x30, 0x00, addr, 0x00);
-    send_data(4);
-    return rx_buf[3];
+    return send_instruction(0x30, 0x00, addr, 0x00) & 0xFF;
 }
 
 uint8_t read_fuse_bits(bool high) {
-    set_instruction(0, 0x50 | (high << 3), 0x00 | (high << 3), 0x00, 0x00);
-    send_data(4);
-    return rx_buf[3];
+    return send_instruction(0x50 | (high << 3), 0x00 | (high << 3), 0x00, 0x00) & 0xFF;
+}
+
+uint8_t read_fuse_bits_extended() {
+    return send_instruction(0x50, 0x08, 0x00, 0x00) & 0xFF;
 }
 
 void enable_programming() {
-    set_instruction(0, 0xAC, 0x53, 0x00, 0x00);
-    send_data(4);
-    if (rx_buf[2] != 0x53)
+    uint8_t echo = send_instruction(0xAC, 0x53, 0x00, 0x00) >> 8 & 0xFF;
+    if (echo != 0x53)
         print_error_end_exit("unable to enter programming mode");
 }
 
-void check_signature() {
+uint32_t read_signature() {
     uint8_t b1 = read_signature_byte(0x00);
     uint8_t b2 = read_signature_byte(0x01);
     uint8_t b3 = read_signature_byte(0x02);
-
-    printf("device signature: 0x%.2X 0x%.2X 0x%.2X", b1, b2, b3);
-    if (b1 == 0x1E && b2 == 0x93 && b3 == 0x07)
-        printf (" | ATmega8\n");
-    else
-        print_error_end_exit(" : not matching ATmega8!");
+    return b1 << 16 | b2 << 8 | b3;
 }
 
 void reset_short_pulse() {
-    gpio_set(conn_params.reset_gpio_pin, 1);
+    if (!gpio_set(conn_params.reset_gpio_pin, 1))
+        print_error_end_exit("unable to set gpio pin value");
+    
     delay(100);
-    gpio_set(conn_params.reset_gpio_pin, 0);
+    
+    if (!gpio_set(conn_params.reset_gpio_pin, 0))
+        print_error_end_exit("unable to set gpio pin value");
 }
 
 void show_progress(const char * message, const char * units, int count, int limit) {
@@ -136,9 +146,12 @@ void show_progress(const char * message, const char * units, int count, int limi
 }
 
 void read_program_memory(uint16_t word_addres, uint8_t buffer[], int len, bool progress) {
-    bool high = false;
-    int bytes_to_read_in_each_message = buffer_size / 4;
+    uint32_t buffer_size = page_size_in_bytes * 4;
+    uint8_t tx_buf[buffer_size];
+    uint8_t rx_buf[buffer_size];
+    int bytes_to_read_in_each_message = page_size_in_bytes;
 
+    bool high = false;
     for (int i = 0; i < len;) {
         int bytes_for_current_read = len - i;
         if (bytes_for_current_read > bytes_to_read_in_each_message)
@@ -146,11 +159,11 @@ void read_program_memory(uint16_t word_addres, uint8_t buffer[], int len, bool p
 
         for (int j = 0; j < bytes_for_current_read; j++) {
             uint16_t addr = word_addres + (i + j) / 2;
-            set_instruction(j * 4, 0x20 | (high << 3), addr >> 8, addr & 0xFF, 0x00);
+            set_instruction(tx_buf + j * 4, 0x20 | (high << 3), addr >> 8, addr & 0xFF, 0x00);
             high = !high;
         }
 
-        send_data(bytes_for_current_read * 4);
+        send_data(tx_buf, rx_buf, bytes_for_current_read * 4);
 
         for (int j = 0; j < bytes_for_current_read; j++)
             buffer[i + j] = rx_buf[j * 4 + 3];
@@ -164,30 +177,32 @@ void read_program_memory(uint16_t word_addres, uint8_t buffer[], int len, bool p
 
 void erase_chip() {
     printf(" # performing chip erase\n");
-    set_instruction(0, 0xAC, 0x80, 0x00, 0x00);
-    send_data(4);
+    send_instruction(0xAC, 0x80, 0x00, 0x00);
     delay(10);
 }
 
 void write_program_memory_page(int page_number) {
-    uint8_t hb = (page_number >> 3) & 0xFF;
-    uint8_t lb = (page_number << 5) & 0xFF;
-    set_instruction(0, 0x4C, hb, lb, 0x00);
-    send_data(4);
+    uint8_t hb = (page_number >> (8 - page_offset)) & 0xFF;
+    uint8_t lb = (page_number << (page_offset)) & 0xFF;
+    send_instruction(0x4C, hb, lb, 0x00);
     delay(10);
 }
 
 void write_fuse_bits(uint8_t value, bool high) {
-    set_instruction(0, 0xAC, 0xA0 | high << 3, 0, value);
-    send_data(4);
+    send_instruction(0xAC, 0xA0 | high << 3, 0, value);
     printf(" # writting fuse %s: 0x%.2X\n", high ? "high" : "low", value);
     delay(10);
 }
 
+void write_fuse_bits_extended(uint8_t value) {
+    send_instruction(0xAC, 0xA4, 0, value);
+    printf(" # writting fuse extended: 0x%.2X\n", value);
+    delay(10);
+}
+
 void write_flash(uint8_t data[], int len, bool progress) {
-#if buffer_size < (page_size_in_bytes * 4)
-#error "buffer_size is too small"
-#endif
+    uint32_t buffer_size = page_size_in_bytes * 4;
+    uint8_t tx_buf[buffer_size];
 
     for (int i = 0, page = 0; i < len;) {
         int bytes_for_current_page = len - i;
@@ -196,13 +211,13 @@ void write_flash(uint8_t data[], int len, bool progress) {
 
         bool high = false;
         for (int j = 0; j < bytes_for_current_page; j++) {
-            set_instruction(j * 4, 0x40 | (high << 3), 0x00, j / 2, data[i + j]);
+            set_instruction(tx_buf + j * 4, 0x40 | (high << 3), 0x00, j / 2, data[i + j]);
             high = !high;
         }
         if (progress)
             show_progress(" # writting flash", "bytes", i + bytes_for_current_page, len);
 
-        send_data(bytes_for_current_page * 4);
+        send_data(tx_buf, NULL, bytes_for_current_page * 4);
         write_program_memory_page(page);
         page++;
         i += page_size_in_bytes;
@@ -255,6 +270,7 @@ void parse_cmd_line(int argc, char ** argv) {
     static struct option long_options[] = {
         {"fuseL", required_argument, NULL, 'l'},
         {"fuseH", required_argument, NULL, 'h'},
+        {"fuseE", required_argument, NULL, 'e'},
         {"flash", required_argument, NULL, 'f'},
         {"spi-driver", required_argument, NULL, 'd'},
         {"spi-speed-hz", required_argument, NULL, 's'},
@@ -273,6 +289,11 @@ void parse_cmd_line(int argc, char ** argv) {
             if (sscanf(optarg, "%hhx", &op_params.fuse_high) == 0)
                 print_error_end_exit("unable to parse --fuseH argument");
             op_params.enabled_operations_bitset |= OP_WRITE_FUSE_HIGH;
+            break;
+        case 'e':
+            if (sscanf(optarg, "%hhx", &op_params.fuse_extended) == 0)
+                print_error_end_exit("unable to parse --fuseE argument");
+            op_params.enabled_operations_bitset |= OP_WRITE_FUSE_EXTENDED;
             break;
         case 'f':
             op_params.flash_file = optarg;
@@ -301,7 +322,9 @@ void parse_cmd_line(int argc, char ** argv) {
 
 int main(int argc, char ** argv) {
     parse_cmd_line(argc, argv);
-    gpio_init_out(conn_params.reset_gpio_pin);
+    if (!gpio_init_out(conn_params.reset_gpio_pin)) {
+        print_error_end_exit("unable to setup gpio pin");
+    }
 
     spi_fd = open(conn_params.spi_device, O_RDWR);
     if (spi_fd == -1) {
@@ -322,18 +345,41 @@ int main(int argc, char ** argv) {
     reset_short_pulse();
 
     enable_programming();
-    check_signature();
-    
-    uint8_t lfuse = read_fuse_bits(false);
-    uint8_t hfuse = read_fuse_bits(true);
 
-    printf("fuses: h:0x%.2X  l:0x%.2X \n", hfuse, lfuse);
+    uint32_t signature_bits = read_signature();
+    printf("device signature: 0x%.2X 0x%.2X 0x%.2X", signature_bits >> 16 & 0xFF, signature_bits >> 8 & 0xFF, signature_bits & 0xFF);
+
+    const struct atmega_memory_config * config = get_atmega_memory_config(signature_bits);
+    if (config == NULL)
+        print_error_end_exit(" # ATmega microcontroller not recognized (or not supported)!");
+
+    printf(" # %s\n", config->name);
+
+    setup(config);
+
+    printf("fuses:");
+    uint8_t hfuse = read_fuse_bits(true);
+    printf("  h:0x%.2X", hfuse);
+    uint8_t lfuse = read_fuse_bits(false);
+    printf("  l:0x%.2X", lfuse);
+    if (config->has_extended_fuse_bits) {
+        uint8_t efuse = read_fuse_bits_extended();
+        printf("  e:0x%.2X", efuse);
+    }
+    printf("\n");
 
     if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_LOW)
         write_fuse_bits(op_params.fuse_low, false);
 
     if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_HIGH)
         write_fuse_bits(op_params.fuse_high, true);
+
+    if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_EXTENDED) {
+        if (!config->has_extended_fuse_bits) {
+            print_error_end_exit("this microcontroller doesn't have extended fuse bits!");
+        }
+        write_fuse_bits_extended(op_params.fuse_extended);
+    }
 
     if (op_params.enabled_operations_bitset & OP_WRITE_FLASH)
         write_flash_from_file(op_params.flash_file);

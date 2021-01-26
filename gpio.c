@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -9,7 +10,9 @@
 extern void delay(int ms);
 
 static bool check_file_exists(const char *path) {
-    return (access(path, F_OK ) != -1);
+    bool success = (access(path, F_OK ) != -1);
+    errno = 0;
+    return success;
 }
 
 static void concat_path(int gpio_pin, const char *gpio_file_name, char *out) {
@@ -29,14 +32,15 @@ static bool write_to_file(const char *path, const char *data) {
 }
 
 static bool read_direction_as_string(const char *path, char *dst) {
+    errno = 0;
     FILE *file = fopen(path, "r");
 
     if (!file)
         return false;
-    
+
     int res = fscanf(file, "%3s", dst);
     fclose(file);
-    
+
     return res > 0;
 }
 
@@ -66,7 +70,7 @@ bool gpio_init_out(int gpio_pin) {
         if (!gpio_export_success)
             return false;
 
-        delay(500);
+        delay(100);
     }
 
     if (!check_file_exists(path))
@@ -83,4 +87,3 @@ bool gpio_set(int gpio_pin, bool value) {
     concat_path(gpio_pin, "value", path);
     return write_to_file(path, value ? "1" : "0");
 }
-

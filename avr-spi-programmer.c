@@ -43,7 +43,7 @@ struct {
     int spi_speed;
     char * spi_device;
 } conn_params = {
-    .reset_gpio_pin = 22,
+    .reset_gpio_pin = 21,
     .spi_mode = 0,
     .spi_speed = 200000,
     .spi_device = "/dev/spidev0.0"
@@ -117,7 +117,7 @@ uint8_t read_fuse_bits_extended() {
 void enable_programming() {
     uint8_t echo = send_instruction(0xAC, 0x53, 0x00, 0x00) >> 8 & 0xFF;
     if (echo != 0x53)
-        print_error_end_exit("unable to enter programming mode");
+        print_error_end_exit("unable to enter programming mode! is the microcontroller connected?");
 }
 
 uint32_t read_signature() {
@@ -130,9 +130,9 @@ uint32_t read_signature() {
 void reset_short_pulse() {
     if (!gpio_set(conn_params.reset_gpio_pin, 1))
         print_error_end_exit("unable to set gpio pin value");
-    
+
     delay(100);
-    
+
     if (!gpio_set(conn_params.reset_gpio_pin, 0))
         print_error_end_exit("unable to set gpio pin value");
 }
@@ -268,34 +268,35 @@ void write_flash_from_file(const char *path) {
 
 void parse_cmd_line(int argc, char ** argv) {
     static struct option long_options[] = {
-        {"fuseL", required_argument, NULL, 'l'},
-        {"fuseH", required_argument, NULL, 'h'},
-        {"fuseE", required_argument, NULL, 'e'},
-        {"flash", required_argument, NULL, 'f'},
+        {"fuseL", required_argument, NULL, 'L'},
+        {"fuseH", required_argument, NULL, 'H'},
+        {"fuseX", required_argument, NULL, 'X'},
+        {"flash", required_argument, NULL, 'F'},
         {"spi-driver", required_argument, NULL, 'd'},
         {"spi-speed-hz", required_argument, NULL, 's'},
         {"reset-pin", required_argument, NULL, 'r'},
+        {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "l:h:f:", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "L:H:X:F:d:s:r:h", long_options, NULL)) != -1) {
         switch (c) {
-        case 'l':
+        case 'L':
             if (sscanf(optarg, "%hhx", &op_params.fuse_low) == 0)
                 print_error_end_exit("unable to parse --fuseL argument");
             op_params.enabled_operations_bitset |= OP_WRITE_FUSE_LOW;
             break;
-        case 'h':
+        case 'H':
             if (sscanf(optarg, "%hhx", &op_params.fuse_high) == 0)
                 print_error_end_exit("unable to parse --fuseH argument");
             op_params.enabled_operations_bitset |= OP_WRITE_FUSE_HIGH;
             break;
-        case 'e':
+        case 'X':
             if (sscanf(optarg, "%hhx", &op_params.fuse_extended) == 0)
                 print_error_end_exit("unable to parse --fuseE argument");
             op_params.enabled_operations_bitset |= OP_WRITE_FUSE_EXTENDED;
             break;
-        case 'f':
+        case 'F':
             op_params.flash_file = optarg;
             op_params.enabled_operations_bitset |= OP_WRITE_FLASH;
             break;
@@ -313,6 +314,32 @@ void parse_cmd_line(int argc, char ** argv) {
             if (sscanf(optarg, "%d", &conn_params.reset_gpio_pin) == 0)
                 print_error_end_exit("unable to parse --reset-pin argument");
             break;
+        case 'h':
+            puts("avr-spi-programmer - simple SPI programmer for ATmega* and ATtiny*");
+            puts("Usage: avr-spi-programmer [OPTION...] [ARGS...]");
+            puts("");
+
+            puts("Settings:");
+            puts("-d --spi-driver        Specify the SPI driver (/dev/spidev...).");
+            puts("                       default: /dev/spidev0.0");
+            puts("-s --spi-speed-hz      Set SPI driver speed in Hz.");
+            puts("                       default: 200000");
+            puts("-r --reset-pin         GPIO pin to connected to RESET. default: 21");
+            puts("                       default: 21");
+            puts("");
+            puts("Programming:");
+            puts("-L --fuseL             Write low fuse.");
+            puts("-H --fuseH             Write hight fuse.");
+            puts("-X --fuseX             Write extended fuse.");
+            puts("-F --flash             Write flash from file.");
+            puts("");
+            puts("Others:");
+            puts("-h --help              Print this help.");
+            puts("<no arguments>         Detect MCU, and read its fuse bytes");
+            puts("");
+            exit(0);
+
+            break;
         case '?':
             exit(-1);
             break;
@@ -325,6 +352,10 @@ int main(int argc, char ** argv) {
     if (!gpio_init_out(conn_params.reset_gpio_pin)) {
         print_error_end_exit("unable to setup gpio pin");
     }
+
+    puts("avr-spi-programmer");
+    puts("------------------");
+    printf("spi: %s, spi speed: %d, reset pin: %d\n", conn_params.spi_device, conn_params.spi_speed, conn_params.reset_gpio_pin);
 
     spi_fd = open(conn_params.spi_device, O_RDWR);
     if (spi_fd == -1) {
@@ -351,7 +382,7 @@ int main(int argc, char ** argv) {
 
     const struct atmega_memory_config * config = get_atmega_memory_config(signature_bits);
     if (config == NULL)
-        print_error_end_exit(" # ATmega microcontroller not recognized (or not supported)!");
+        print_error_end_exit(" # AVR microcontroller not recognized (or not supported)!");
 
     printf(" # %s\n", config->name);
 
@@ -366,7 +397,8 @@ int main(int argc, char ** argv) {
         uint8_t efuse = read_fuse_bits_extended();
         printf("  e:0x%.2X", efuse);
     }
-    printf("\n");
+
+    puts("");
 
     if (op_params.enabled_operations_bitset & OP_WRITE_FUSE_LOW)
         write_fuse_bits(op_params.fuse_low, false);

@@ -5,7 +5,7 @@ It uses **SPI** (3 wires directly connected to the microcontroller), **GPIO** (o
 
 In this configuration the MCU can be powered from the 3.3v RPi line probably (I mean, only the microcontroller itself. If you draw more power from the 3.3v RPi line (like more than 50mA) you can fry you RPi).
 
-Do not use 5v as it would probably damage the RPi.
+**Do not use 5v as it would probably damage the RPi!.**
 
 Currently supported models include:
 - ATmega8*

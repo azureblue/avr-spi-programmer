@@ -301,8 +301,8 @@ void parse_cmd_line(int argc, char ** argv) {
             op_params.enabled_operations_bitset |= OP_WRITE_FLASH;
             break;
 
-//
-
+// settings
+            
         case 'd':
             conn_params.spi_device = optarg;
             break;
